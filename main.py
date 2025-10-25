@@ -1,162 +1,158 @@
-import ccxt
+import os
+import math
+import time
+import asyncio
+import logging
+from datetime import datetime
 import pandas as pd
 import numpy as np
-import requests
-import time
-from datetime import datetime
-import logging
-import schedule
-import os
+from binance.client import Client
+from binance.enums import *
 
-# Configurar logging para cloud
+# Configurações de log
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler()]
 )
-logger = logging.getLogger(__name__)
 
-# Configurações (usando variáveis de ambiente)
-TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
-
-CRYPTO_SYMBOLS = [
-    'BTC/USDT', 'ETH/USDT', 'XRP/USDT', 'BNB/USDT', 
-    'SOL/USDT', 'DOGE/USDT', 'TRX/USDT', 'ADA/USDT',
-    'LINK/USDT', 'AVAX/USDT'
-]
-
-class CryptoAnalyzer:
+class BinanceSignalValidator:
     def __init__(self):
-        self.exchange = ccxt.binance({
-            'rateLimit': 1200,
-            'enableRateLimit': True,
-            'timeout': 30000,
-        })
-        
-    def send_telegram_message(self, message):
-        """Envia mensagem para o Telegram"""
-        if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-            logger.error("Variáveis de ambiente não configuradas")
-            return
-            
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        payload = {
-            'chat_id': TELEGRAM_CHAT_ID,
-            'text': message,
-            'parse_mode': 'HTML'
-        }
-        
+        self.client = Client(
+            api_key=os.getenv("BINANCE_API_KEY"),
+            api_secret=os.getenv("BINANCE_API_SECRET"),
+            testnet=False  # Altere para True se quiser usar testnet
+        )
+        self.symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+        self.interval = Client.KLINE_INTERVAL_15MINUTE
+        self.limit = 200
+
+    # ======================
+    # === INDICADORES ====
+    # ======================
+    def ema(self, series, period):
+        return series.ewm(span=period, adjust=False).mean()
+
+    def macd(self, close):
+        ema12 = self.ema(close, 12)
+        ema26 = self.ema(close, 26)
+        macd_line = ema12 - ema26
+        signal_line = self.ema(macd_line, 9)
+        hist = macd_line - signal_line
+        return macd_line, signal_line, hist
+
+    def rsi(self, close, period=14):
+        delta = close.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
+        rs = gain / loss
+        return 100 - (100 / (1 + rs))
+
+    # ================================
+    # === SUPORTE / RESISTÊNCIA ====
+    # ================================
+    def detect_support_resistance(self, df, window=5):
+        highs, lows = df["high"], df["low"]
+        resistance, support = [], []
+
+        for i in range(window, len(df) - window):
+            high_slice = highs[i - window:i + window]
+            low_slice = lows[i - window:i + window]
+
+            if highs[i] == high_slice.max():
+                resistance.append(highs[i])
+            if lows[i] == low_slice.min():
+                support.append(lows[i])
+
+        def clean(levels):
+            if not levels:
+                return []
+            clean_list = []
+            for lvl in sorted(levels):
+                if not clean_list or abs(lvl - clean_list[-1]) / clean_list[-1] > 0.005:
+                    clean_list.append(lvl)
+            return clean_list
+
+        return clean(support), clean(resistance)
+
+    def detect_zone(self, df, rsi, price):
+        supports, resistances = self.detect_support_resistance(df)
+        near_support = any(abs(price - s) / s < 0.003 for s in supports)
+        near_resistance = any(abs(price - r) / r < 0.003 for r in resistances)
+
+        if rsi >= 70 and near_resistance:
+            return "🟥 SOBRECOMPRA em RESISTÊNCIA"
+        elif rsi <= 30 and near_support:
+            return "🟩 SOBREVENDA em SUPORTE"
+        return None
+
+    # ======================
+    # === ANÁLISE ====
+    # ======================
+    async def analyze_symbol(self, symbol):
         try:
-            response = requests.post(url, json=payload)
-            if response.status_code == 200:
-                logger.info("✅ Mensagem enviada")
-            else:
-                logger.error(f"❌ Erro: {response.status_code}")
-        except Exception as e:
-            logger.error(f"❌ Erro Telegram: {e}")
-    
-    def calculate_rsi(self, prices, period=14):
-        """Calcula RSI simplificado"""
-        if len(prices) < period:
-            return 50
+            klines = self.client.get_klines(
+                symbol=symbol, 
+                interval=self.interval, 
+                limit=self.limit
+            )
             
-        deltas = np.diff(prices)
-        gains = np.where(deltas > 0, deltas, 0)
-        losses = np.where(deltas < 0, -deltas, 0)
-        
-        avg_gains = pd.Series(gains).rolling(window=period).mean()
-        avg_losses = pd.Series(losses).rolling(window=period).mean()
-        
-        rs = avg_gains / avg_losses
-        rsi = 100 - (100 / (1 + rs))
-        return rsi.iloc[-1] if not rsi.empty and not pd.isna(rsi.iloc[-1]) else 50
+            df = pd.DataFrame(klines, columns=[
+                "open_time", "open", "high", "low", "close", "volume",
+                "close_time", "quote_asset_volume", "trades",
+                "taker_buy_base", "taker_buy_quote", "ignore"
+            ])
+            
+            # Converter para float
+            for col in ["open", "high", "low", "close", "volume"]:
+                df[col] = df[col].astype(float)
 
-    def get_ohlcv_data(self, symbol, timeframe='1h', limit=100):
-        """Obtém dados da exchange"""
-        try:
-            ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
-            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            return df
-        except Exception as e:
-            logger.error(f"Erro ao buscar {symbol}: {e}")
-            return None
+            close = df["close"]
+            ema20 = self.ema(close, 20)
+            rsi_series = self.rsi(close)
+            rsi_val = rsi_series.iloc[-1] if not rsi_series.empty else 50
+            macd_line, signal_line, hist = self.macd(close)
 
-    def analyze_crypto(self, symbol):
-        """Analisa uma criptomoeda"""
-        df = self.get_ohlcv_data(symbol)
-        if df is None or len(df) < 50:
-            return None
+            price = close.iloc[-1]
+            zone = self.detect_zone(df, rsi_val, price)
 
-        prices = df['close'].tolist()
-        rsi = self.calculate_rsi(prices)
-        
-        # Análise simplificada para cloud
-        signal = "NEUTRO"
-        if rsi <= 30:
-            signal = "COMPRA"
-        elif rsi >= 70:
-            signal = "VENDA"
-        
-        analysis = {
-            'symbol': symbol,
-            'price': prices[-1],
-            'rsi': rsi,
-            'signal': signal,
-            'timestamp': datetime.now()
-        }
-        
-        return analysis
+            trend = "⬆️ Alta" if ema20.iloc[-1] > ema20.iloc[-2] else "⬇️ Baixa"
+            macd_status = "Bullish" if macd_line.iloc[-1] > signal_line.iloc[-1] else "Bearish"
 
-    def analyze_all_cryptos(self):
-        """Analisa todas as criptomoedas"""
-        logger.info("🔍 Iniciando análise...")
-        
-        for symbol in CRYPTO_SYMBOLS:
-            try:
-                analysis = self.analyze_crypto(symbol)
-                if analysis and analysis['signal'] != "NEUTRO":
-                    message = f"""
-{'🟢' if analysis['signal'] == 'COMPRA' else '🔴'} <b>ALERTA {analysis['signal']}</b>
+            signal = None
+            if rsi_val >= 70:
+                signal = "SOBRECOMPRA"
+            elif rsi_val <= 30:
+                signal = "SOBREVENDA"
+            elif zone:
+                signal = "ALERTA"
 
-<b>Moeda:</b> {analysis['symbol']}
-<b>Preço:</b> ${analysis['price']:.4f}
-<b>RSI:</b> {analysis['rsi']:.2f}
-
-<b>Horário:</b> {analysis['timestamp'].strftime('%d/%m/%Y %H:%M')}
+            msg = f"""
+📊 {symbol}
+💰 Preço: {price:.2f} USDT
+📈 RSI: {rsi_val:.2f}
+📊 MACD: {macd_status}
+📉 Tendência EMA20: {trend}
 """
-                    self.send_telegram_message(message)
-                    logger.info(f"Sinal {analysis['signal']} para {analysis['symbol']}")
-                
-                time.sleep(1)  # Rate limit
-                
-            except Exception as e:
-                logger.error(f"Erro em {symbol}: {e}")
-                continue
+            if zone:
+                msg += f"\n⚠️ {zone}\n"
+            elif signal:
+                msg += f"\n⚠️ {signal}\n"
 
-def main():
-    """Função principal otimizada para cloud"""
-    analyzer = CryptoAnalyzer()
-    
-    # Verificar se variáveis estão configuradas
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.error("❌ Variáveis de ambiente não configuradas!")
-        return
-    
-    # Mensagem de início
-    analyzer.send_telegram_message("🤖 <b>Bot Iniciado na Nuvem!</b>")
-    logger.info("🤖 Bot iniciado na nuvem!")
-    
-    # Configurar schedule
-    schedule.every(30).minutes.do(analyzer.analyze_all_cryptos)
-    
-    # Loop principal
-    while True:
-        try:
-            schedule.run_pending()
-            time.sleep(60)  # Verificar a cada minuto
+            logging.info(msg.strip())
+            
         except Exception as e:
-            logger.error(f"Erro no loop principal: {e}")
-            time.sleep(300)  # Espera 5 minutos em caso de erro
+            logging.error(f"Erro analisando {symbol}: {e}")
+
+    async def run(self):
+        while True:
+            logging.info("Iniciando análise dos símbolos...")
+            tasks = [self.analyze_symbol(sym) for sym in self.symbols]
+            await asyncio.gather(*tasks)
+            logging.info("Análise concluída. Aguardando próximo ciclo...")
+            await asyncio.sleep(60)  # intervalo entre análises
+
 
 if __name__ == "__main__":
-    main()
+    validator = BinanceSignalValidator()
+    asyncio.run(validator.run())
